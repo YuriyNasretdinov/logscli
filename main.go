@@ -31,6 +31,7 @@ var (
 	contextLines = flag.Uint("C", 0, "How many lines of context to return both before and after the found line")
 	fixedString  = flag.String("F", "", "Fixed string search")
 	regexString  = flag.String("E", "", "Regex string search")
+	tailF        = flag.Bool("tailf", false, "Print incoming logs continiously")
 
 	// log filtering parameters
 	reverse = flag.Bool("reverse", true, "Whether or not to return results in reverse chronological order")
@@ -38,8 +39,10 @@ var (
 	after   = flag.String("after", "", "Date and time after which to display results (without milliseconds)")
 
 	// clickhouse parameters
-	fields    = flag.String("fields", "review_body", "Comma-separated list of fields to return in the result in addition to timestamp (possible fields: marketplace,customer_id,review_id,product_id,product_parent,product_title,product_category,star_rating,helpful_votes,total_votes,vine,verified_purchase,review_headline,review_body,review_date)")
-	textField = flag.String("text-field", "review_body", "The name of the text field that is being matched")
+	fields          = flag.String("fields", "review_body", "Comma-separated list of fields to return in the result in addition to timestamp (possible fields: marketplace,customer_id,review_id,product_id,product_parent,product_title,product_category,star_rating,helpful_votes,total_votes,vine,verified_purchase,review_headline,review_body,review_date)")
+	textField       = flag.String("text-field", "review_body", "The name of the text field that is being matched")
+	additionalWhere = flag.String("where", "", `Additional filters in WHERE (e.g. "vine='Y' AND star_rating>4")`)
+	limit           = flag.Uint("limit", 0, "Limit the number of results (0 means no limit)")
 
 	table  = flag.String("table", "amazon", "The name of the table to scan")
 	chAddr = flag.String("ch-addr", "localhost:8123", "ClickHouse server address (HTTP endpoint)")
@@ -92,6 +95,12 @@ func Escape(txt string) string {
 
 func makeFilterConds() []string {
 	var conds []string
+
+	conds = append(conds, "1=1")
+
+	if *additionalWhere != "" {
+		conds = append(conds, "("+(*additionalWhere)+")")
+	}
 
 	if *fixedString != "" {
 		conds = append(conds, `position(`+(*textField)+`, '`+Escape(*fixedString)+`') <> 0`)
@@ -166,10 +175,11 @@ func printContextResults(date string, millis int, isBefore bool, numLines uint) 
 		fmt.Printf("(context calculated for %s) ", time.Since(start))
 	}
 
-	return printResults(bufio.NewReader(strings.NewReader(strings.Join(res, "\n")+"\n")), false)
+	_, _, err = printResults(bufio.NewReader(strings.NewReader(strings.Join(res, "\n")+"\n")), false)
+	return err
 }
 
-func runMain() error {
+func runMain() (lastDate string, lastMillis int, err error) {
 	rand.Seed(time.Now().UnixNano())
 
 	desc := " DESC"
@@ -177,10 +187,16 @@ func runMain() error {
 		desc = ""
 	}
 
+	limitPart := ""
+	if *limit != 0 {
+		limitPart = fmt.Sprintf("LIMIT %d", *limit)
+	}
+
 	query := `SELECT time,millis,` + (*fields) + `
 		FROM ` + (*table) + `
 		WHERE ` + strings.Join(makeFilterConds(), " AND ") + `
 		ORDER BY time` + desc + `, millis` + desc + `
+		` + limitPart + `
 		FORMAT TabSeparatedRaw`
 
 	if *debug {
@@ -194,17 +210,17 @@ func runMain() error {
 
 	conn, err := net.Dial("tcp", *chAddr)
 	if err != nil {
-		return err
+		return "", 0, err
 	}
 	defer conn.Close()
 
 	rd := bufio.NewReader(conn)
 	wr := bufio.NewWriter(conn)
 	if _, err := fmt.Fprintf(wr, "GET /?%s HTTP/1.0\n\n", u.Encode()); err != nil {
-		return err
+		return "", 0, err
 	}
 	if err := wr.Flush(); err != nil {
-		return err
+		return "", 0, err
 	}
 
 	start := time.Now()
@@ -212,7 +228,7 @@ func runMain() error {
 	for {
 		ln, err := rd.ReadString('\n')
 		if err != nil {
-			return fmt.Errorf("unexpected error while reading headers: %v", err)
+			return "", 0, fmt.Errorf("unexpected error while reading headers: %v", err)
 		}
 		ln = strings.TrimSpace(ln)
 		if ln == "" {
@@ -223,7 +239,7 @@ func runMain() error {
 			var p Progress
 			data := strings.TrimPrefix(ln, "X-ClickHouse-Progress: ")
 			if err := json.Unmarshal([]byte(data), &p); err != nil {
-				return fmt.Errorf("unmarshalling %q: %v", data, err)
+				return "", 0, fmt.Errorf("unmarshalling %q: %v", data, err)
 			}
 
 			read := float64(p.ReadBytes) / (1 << 30)
@@ -238,19 +254,19 @@ func runMain() error {
 	return printResults(rd, true)
 }
 
-func printResults(rd *bufio.Reader, printContext bool) error {
+func printResults(rd *bufio.Reader, printContext bool) (lastDate string, lastMillis int, err error) {
 	for {
 		ln, err := rd.ReadString('\n')
 		if err == io.EOF {
-			return nil
+			return lastDate, lastMillis, nil
 		} else if err != nil {
-			return err
+			return "", 0, err
 		}
 
 		parts := strings.SplitN(ln, "\t", 3)
 		if len(parts) < 3 {
 			if _, err := os.Stdout.WriteString(ln); err != nil {
-				return err
+				return "", 0, err
 			}
 			continue
 		}
@@ -258,9 +274,12 @@ func printResults(rd *bufio.Reader, printContext bool) error {
 		date, millisStr, rest := parts[0], parts[1], parts[2]
 		millis, _ := strconv.Atoi(millisStr)
 
+		lastDate = date
+		lastMillis = millis
+
 		if printContext && (*beforeLines > 0) {
 			if err := printContextResults(date, millis, true, *beforeLines); err != nil {
-				return err
+				return "", 0, err
 			}
 		}
 
@@ -268,7 +287,7 @@ func printResults(rd *bufio.Reader, printContext bool) error {
 
 		if printContext && (*afterLines > 0) {
 			if err := printContextResults(date, millis, false, *afterLines); err != nil {
-				return err
+				return "", 0, err
 			}
 		}
 
@@ -277,7 +296,7 @@ func printResults(rd *bufio.Reader, printContext bool) error {
 		}
 	}
 
-	return nil
+	return lastDate, lastMillis, nil
 }
 
 func main() {
@@ -295,7 +314,31 @@ func main() {
 		os.Exit(0)
 	}()
 
-	if err := runMain(); err != nil {
+	if *tailF {
+		*reverse = false
+		if *after == "" {
+			*after = fmt.Sprint(time.Now().Add(-time.Minute).Unix())
+		}
+
+		for {
+			lastDate, _, err := runMain()
+			if err != nil {
+				if strings.Contains(err.Error(), "broken pipe") {
+					return
+				}
+
+				log.Fatalf("FATAL error: %v", err)
+			}
+
+			if lastDate != "" {
+				*after = lastDate
+			}
+
+			time.Sleep(time.Second)
+		}
+	}
+
+	if _, _, err := runMain(); err != nil {
 		if strings.Contains(err.Error(), "broken pipe") {
 			return
 		}
