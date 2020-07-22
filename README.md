@@ -2,7 +2,7 @@
 CLI for logs based on top of ClickHouse
 
 # Installation
-`$ go get https://github.com/YuriyNasretdinov/logscli`
+`$ go get github.com/YuriyNasretdinov/logscli`
 
 # ClickHouse table requirements
 You need to have a ClickHouse table with logs that you would like to view that has the following fields:
